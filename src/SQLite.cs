@@ -25,6 +25,7 @@
 
 using System;
 using System.Collections;
+using System.ComponentModel;
 using System.Diagnostics;
 #if !USE_SQLITEPCL_RAW
 using System.Runtime.InteropServices;
@@ -514,6 +515,20 @@ namespace SQLite
 				var decls = map.Columns.Select (p => Orm.SqlDecl (p, StoreDateTimeAsTicks));
 				var decl = string.Join (",\n", decls.ToArray ());
 				query += decl;
+
+				if (map.Columns.Where (item => item.IsPK).Count () > 1) {
+					query = query.Replace (" primary key", "");
+
+					String pkString = ", primary key(";
+
+					foreach (String s in map.Columns.Where (item => item.IsPK).Select (item => item.Name))
+						pkString += s + ", ";
+
+					pkString = pkString.Substring (0, pkString.Length - 2) + ")";
+
+					query += pkString;
+				}
+
 				query += ")";
 				if(map.WithoutRowId) {
 					query += " without rowid";
@@ -1763,14 +1778,14 @@ namespace SQLite
 
 			var map = GetMapping (objType);
 
-			var pk = map.PK;
-
-			if (pk == null) {
+			if (map.PK.Length == 0) {
 				throw new NotSupportedException ("Cannot update " + map.TableName + ": it has no PK");
 			}
 
+			var pks = map.PK;
+
 			var cols = from p in map.Columns
-					   where p != pk
+					   where !pks.Contains (p)
 					   select p;
 			var vals = from c in cols
 					   select c.GetValue (obj);
@@ -1783,9 +1798,14 @@ namespace SQLite
 					   select c.GetValue (obj);
 				ps = new List<object> (vals);
 			}
-			ps.Add (pk.GetValue (obj));
-			var q = string.Format ("update \"{0}\" set {1} where {2} = ? ", map.TableName, string.Join (",", (from c in cols
-																											  select "\"" + c.Name + "\" = ? ").ToArray ()), pk.Name);
+
+			List<String> whereClauses = new List<String> ();
+			foreach (var pk in pks) {
+				ps.Add (pk.GetValue (obj));
+				whereClauses.Add (String.Format ("\"{0}\" = ?", pk.Name));
+			}
+			var q = string.Format ("update \"{0}\" set {1} where {2}", map.TableName, string.Join (",", (from c in cols
+																										 select "\"" + c.Name + "\" = ? ").ToArray ()), String.Join (" and ", whereClauses));
 
 			try {
 				rowsAffected = Execute (q, ps.ToArray ());
@@ -1847,12 +1867,19 @@ namespace SQLite
 		public int Delete (object objectToDelete)
 		{
 			var map = GetMapping (Orm.GetType (objectToDelete));
-			var pk = map.PK;
-			if (pk == null) {
+			if (map.PK.Length == 0) {
 				throw new NotSupportedException ("Cannot delete " + map.TableName + ": it has no PK");
 			}
-			var q = string.Format ("delete from \"{0}\" where \"{1}\" = ?", map.TableName, pk.Name);
-			var count = Execute (q, pk.GetValue (objectToDelete));
+
+			List<String> whereClauses = new List<String> ();
+			List<Object> values = new List<Object> ();
+			foreach (var pk in map.PK) {
+				whereClauses.Add (String.Format ("\"{0}\" = ?", pk.Name));
+				values.Add (pk.GetValue (objectToDelete));
+			}
+			var q = string.Format ("delete from \"{0}\" where {1}", map.TableName, String.Join (" and ", whereClauses));
+
+			var count = Execute (q, values.ToArray ());
 			if (count > 0)
 				OnTableChanged (map, NotifyTableChangedAction.Delete);
 			return count;
@@ -1889,10 +1916,13 @@ namespace SQLite
 		/// </returns>
 		public int Delete (object primaryKey, TableMapping map)
 		{
-			var pk = map.PK;
-			if (pk == null) {
+			if (map.PK.Length == 0) {
 				throw new NotSupportedException ("Cannot delete " + map.TableName + ": it has no PK");
 			}
+			if (map.PK.Length > 1) {
+				throw new NotSupportedException ("Cannot delete " + map.TableName + ": it has multiple PKs");
+			}
+			var pk = map.PK.Single ();
 			var q = string.Format ("delete from \"{0}\" where \"{1}\" = ?", map.TableName, pk.Name);
 			var count = Execute (q, primaryKey);
 			if (count > 0)
@@ -1946,6 +1976,11 @@ namespace SQLite
 		{
 			Dispose (true);
 			GC.SuppressFinalize (this);
+		}
+
+		public Boolean IsOpen 
+		{
+			get { return _open; }
 		}
 
 		public void Close ()
@@ -2059,6 +2094,8 @@ namespace SQLite
 	{
 		public string Name { get; set; }
 
+		public Boolean MarkedColumnsOnly { get; set; }
+
 		/// <summary>
 		/// Flag whether to create the table without rowid (see https://sqlite.org/withoutrowid.html)
 		///
@@ -2066,20 +2103,24 @@ namespace SQLite
 		/// </summary>
 		public bool WithoutRowId { get; set; }
 
-		public TableAttribute (string name)
+		public TableAttribute (string name, Boolean markedColumnsOnly = false)
 		{
 			Name = name;
+			MarkedColumnsOnly = markedColumnsOnly;
 		}
 	}
 
-	[AttributeUsage (AttributeTargets.Property)]
+	[AttributeUsage (AttributeTargets.Property | AttributeTargets.Field)]
 	public class ColumnAttribute : Attribute
 	{
 		public string Name { get; set; }
 
-		public ColumnAttribute (string name)
+		public String Storage { get; set; }
+
+		public ColumnAttribute (string name, String storage = null)
 		{
 			Name = name;
+			Storage = storage;
 		}
 	}
 
@@ -2178,7 +2219,7 @@ namespace SQLite
 
 		public Column[] Columns { get; private set; }
 
-		public Column PK { get; private set; }
+		public Column[] PK { get; private set; }
 
 		public string GetByPrimaryKeySql { get; private set; }
 
@@ -2201,6 +2242,7 @@ namespace SQLite
 						.FirstOrDefault ();
 
 			TableName = (tableAttr != null && !string.IsNullOrEmpty (tableAttr.Name)) ? tableAttr.Name : MappedType.Name;
+			Boolean markedColumnsOnly = tableAttr != null ? tableAttr.MarkedColumnsOnly : false;
 			WithoutRowId = tableAttr != null ? tableAttr.WithoutRowId : false;
 
 			var props = new List<PropertyInfo> ();
@@ -2217,6 +2259,8 @@ namespace SQLite
 						(p.GetMethod.IsPublic && p.SetMethod.IsPublic) &&
 						(!p.GetMethod.IsStatic) && (!p.SetMethod.IsStatic)
 					select p).ToList ();
+				if (markedColumnsOnly)
+					newProps = newProps.Where (item => item.GetCustomAttributes (typeof (ColumnAttribute), true).Count () > 0).ToList();
 				foreach (var p in newProps) {
 					propNames.Add (p.Name);
 				}
@@ -2232,19 +2276,25 @@ namespace SQLite
 				}
 			}
 			Columns = cols.ToArray ();
+			List<Column> pks = new List<Column> ();
 			foreach (var c in Columns) {
 				if (c.IsAutoInc && c.IsPK) {
 					_autoPk = c;
 				}
 				if (c.IsPK) {
-					PK = c;
+					pks.Add (c);
 				}
 			}
+			
+			PK = pks.ToArray ();
 
 			HasAutoIncPK = _autoPk != null;
 
-			if (PK != null) {
-				GetByPrimaryKeySql = string.Format ("select * from \"{0}\" where \"{1}\" = ?", TableName, PK.Name);
+			if (PK.Length > 0) {
+				List<String> whereClauses = new List<String> ();
+				foreach (var pk in PK)
+					whereClauses.Add (String.Format ("\"{0}\" = ?", pk.Name));
+				GetByPrimaryKeySql = string.Format ("select * from \"{0}\" where {1}", TableName, String.Join (" and ", whereClauses));
 			}
 			else {
 				// People should not be calling Get/Find without a PK
@@ -2292,6 +2342,8 @@ namespace SQLite
 		{
 			PropertyInfo _prop;
 
+			FieldInfo _field = null;
+
 			public string Name { get; private set; }
 
 			public PropertyInfo PropertyInfo => _prop;
@@ -2323,6 +2375,12 @@ namespace SQLite
 				Name = (colAttr != null && colAttr.ConstructorArguments.Count > 0) ?
 						colAttr.ConstructorArguments[0].Value?.ToString () :
 						prop.Name;
+
+				if (colAttr != null && colAttr.Storage != null) {
+					List<FieldInfo> fields = prop.DeclaringType.GetRuntimeFields ().ToList ();
+					_field = fields.Where (item => item.Name == colAttr.Storage).FirstOrDefault ();
+				}
+
 				//If this type is Nullable<T> then Nullable.GetUnderlyingType returns the T, otherwise it returns null, so get the actual type instead
 				ColumnType = Nullable.GetUnderlyingType (prop.PropertyType) ?? prop.PropertyType;
 				Collation = Orm.Collation (prop);
@@ -2351,17 +2409,30 @@ namespace SQLite
 
 			public void SetValue (object obj, object val)
 			{
-				if (val != null && ColumnType.GetTypeInfo ().IsEnum) {
-					_prop.SetValue (obj, Enum.ToObject (ColumnType, val));
+				if (_field == null) {
+					if (val != null && ColumnType.GetTypeInfo ().IsEnum) {
+						_prop.SetValue (obj, Enum.ToObject (ColumnType, val));
+					}
+					else {
+						_prop.SetValue (obj, val, null);
+					}
 				}
 				else {
-					_prop.SetValue (obj, val, null);
+					if (val != null && ColumnType.GetTypeInfo ().IsEnum) {
+						_field.SetValue (obj, Enum.ToObject (ColumnType, val));
+					}
+					else {
+						_field.SetValue (obj, val);
+					}
 				}
 			}
 
 			public object GetValue (object obj)
 			{
-				return _prop.GetValue (obj, null);
+				if (_field == null)
+					return _prop.GetValue (obj, null);
+				else
+					return _field.GetValue (obj);
 			}
 		}
 	}
@@ -2484,7 +2555,7 @@ namespace SQLite
 				else
 					return "integer";
 			}
-			else if (clrType == typeof (byte[])) {
+			else if (clrType == typeof (byte[]) || clrType == typeof (System.Data.Linq.Binary)) {
 				return "blob";
 			}
 			else if (clrType == typeof (Guid)) {
@@ -2665,6 +2736,12 @@ namespace SQLite
 
 				while (SQLite3.Step (stmt) == SQLite3.Result.Row) {
 					var obj = Activator.CreateInstance (map.MappedType);
+					if (obj is WaterOutlookDataContextObject) {
+						WaterOutlookDataContextObject waterObj = obj as WaterOutlookDataContextObject;
+						waterObj.dc = this._conn as WaterOutlookDataContext;
+						if (waterObj is INotifyPropertyChanged)
+							(waterObj as INotifyPropertyChanged).PropertyChanged += waterObj.dc.PropertyChanged;
+					}
 					for (int i = 0; i < cols.Length; i++) {
 						if (cols[i] == null)
 							continue;
@@ -2807,6 +2884,10 @@ namespace SQLite
 				else if (value is byte[]) {
 					SQLite3.BindBlob (stmt, index, (byte[])value, ((byte[])value).Length, NegativePointer);
 				}
+				else if (value is System.Data.Linq.Binary) {
+					Byte[] b = ((System.Data.Linq.Binary)value).ToArray ();
+					SQLite3.BindBlob (stmt, index, b, b.Length, NegativePointer);
+				}
 				else if (value is Guid) {
 					SQLite3.BindText (stmt, index, ((Guid)value).ToString (), 72, NegativePointer);
 				}
@@ -2918,6 +2999,9 @@ namespace SQLite
 				}
 				else if (clrType == typeof (byte[])) {
 					return SQLite3.ColumnByteArray (stmt, index);
+				}
+				else if (clrType == typeof (System.Data.Linq.Binary)) {
+					return new System.Data.Linq.Binary (SQLite3.ColumnByteArray (stmt, index));
 				}
 				else if (clrType == typeof (Guid)) {
 					var text = SQLite3.ColumnString (stmt, index);
@@ -3054,7 +3138,7 @@ namespace SQLite
 		}
 	}
 
-	public class TableQuery<T> : BaseTableQuery, IEnumerable<T>
+	public partial class TableQuery<T> : BaseTableQuery, IEnumerable<T>
 	{
 		public SQLiteConnection Connection { get; private set; }
 
