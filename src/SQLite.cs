@@ -37,6 +37,8 @@ using System.Linq.Expressions;
 using System.Text;
 using System.Threading;
 
+using WaterOutlook.Mobile.Data;
+
 #if USE_CSHARP_SQLITE
 using Sqlite3 = Community.CsharpSqlite.Sqlite3;
 using Sqlite3DatabaseHandle = Community.CsharpSqlite.Sqlite3.sqlite3;
@@ -1640,9 +1642,11 @@ namespace SQLite
 
 			var map = GetMapping (objType);
 
-			if (map.PK != null && map.PK.IsAutoGuid) {
-				if (map.PK.GetValue (obj).Equals (Guid.Empty)) {
-					map.PK.SetValue (obj, Guid.NewGuid ());
+            var firstPK = map.PK.FirstOrDefault();
+
+			if (firstPK != null && firstPK.IsAutoGuid) {
+				if (firstPK.GetValue (obj).Equals (Guid.Empty)) {
+                    firstPK.SetValue (obj, Guid.NewGuid ());
 				}
 			}
 
@@ -2376,9 +2380,9 @@ namespace SQLite
 						colAttr.ConstructorArguments[0].Value?.ToString () :
 						prop.Name;
 
-				if (colAttr != null && colAttr.Storage != null) {
+				if (colAttr != null && colAttr.NamedArguments.Count(item => item.MemberName == "Storage") > 0) {
 					List<FieldInfo> fields = prop.DeclaringType.GetRuntimeFields ().ToList ();
-					_field = fields.Where (item => item.Name == colAttr.Storage).FirstOrDefault ();
+					_field = fields.Where (item => item.Name == colAttr.NamedArguments.Single(col => col.MemberName == "Storage").TypedValue.Value.ToString()).FirstOrDefault ();
 				}
 
 				//If this type is Nullable<T> then Nullable.GetUnderlyingType returns the T, otherwise it returns null, so get the actual type instead
@@ -3716,10 +3720,10 @@ namespace SQLite
 		/// <summary>
 		/// Execute SELECT COUNT(*) on the query with an additional WHERE clause.
 		/// </summary>
-		public int Count (Expression<Func<T, bool>> predExpr)
+		/*public int Count (Expression<Func<T, bool>> predExpr)
 		{
 			return Where (predExpr).Count ();
-		}
+		}*/
 
 		public IEnumerator<T> GetEnumerator ()
 		{

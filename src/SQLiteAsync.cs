@@ -1251,10 +1251,10 @@ namespace SQLite
 		/// <summary>
 		/// Execute SELECT COUNT(*) on the query with an additional WHERE clause.
 		/// </summary>
-		public Task<int> CountAsync (Expression<Func<T, bool>> predExpr)
+		/*public Task<int> CountAsync (Expression<Func<T, bool>> predExpr)
 		{
 			return ReadAsync (conn => _innerQuery.Count (predExpr));
-		}
+		}*/
 
 		/// <summary>
 		/// Returns the element at a given index
